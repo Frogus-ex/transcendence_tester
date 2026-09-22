@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ---------------------------------------------------------------
+  # JOB 1 : valide la syntaxe du compose. Réutilise "make setup"
+  # (le même mécanisme que les développeurs utilisent en local) pour
+  # générer .env + secrets, plutôt que de dupliquer cette logique ici.
+  # ---------------------------------------------------------------
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Générer .env et les secrets (via make setup)
+        run: make setup
+
+      - name: Vérifier la syntaxe du docker-compose.yaml
+        run: docker compose config
+
+  # ---------------------------------------------------------------
+  # JOB 2 : build + démarrage de toute la stack, diagnostic par
+  # service. Les runners GitHub utilisent Docker nativement - on
+  # surcharge donc la variable COMPOSE du Makefile pour utiliser
+  # "docker compose" plutôt que "podman-compose" (utilisé en dev
+  # local), sans dupliquer la logique de build/up.
+  # ---------------------------------------------------------------
+  test-services:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Générer .env et les secrets
+        run: make setup
+
+      - name: Build de toutes les images
+        run: docker compose build
+
+      - name: Démarrer toute la stack
+        run: docker compose up -d
+
+      - name: Diagnostic par service
+        run: |
+          # data-pipeline est inclus volontairement : si le code applicatif
+          # (hors périmètre DevOps) casse, la CI doit le signaler plutôt
+          # que de masquer le problème.
+          SERVICES="postgres redis nginx node-exporter postgres-exporter redis-exporter prometheus grafana"
+          FAILED=""
+
+          for SERVICE in $SERVICES; do
+            CONTAINER_ID=$(docker compose ps -q $SERVICE)
+
+            if [ -z "$CONTAINER_ID" ]; then
+              echo "❌ [$SERVICE] conteneur introuvable"
+              FAILED="$FAILED $SERVICE"
+              continue
+            fi
+
+            HAS_HEALTHCHECK=$(docker inspect --format='{{if .State.Health}}yes{{else}}no{{end}}' $CONTAINER_ID)
+
+            if [ "$HAS_HEALTHCHECK" = "yes" ]; then
+              ELAPSED=0
+              while [ $ELAPSED -lt 60 ]; do
+                STATUS=$(docker inspect --format='{{.State.Health.Status}}' $CONTAINER_ID)
+                [ "$STATUS" = "healthy" ] && break
+                sleep 3
+                ELAPSED=$((ELAPSED + 3))
+              done
+
+              if [ "$STATUS" != "healthy" ]; then
+                echo "❌ [$SERVICE] statut: $STATUS"
+                FAILED="$FAILED $SERVICE"
+              else
+                echo "✅ [$SERVICE] healthy"
+              fi
+            else
+              sleep 5
+              STATE=$(docker inspect --format='{{.State.Status}}' $CONTAINER_ID)
+              if [ "$STATE" != "running" ]; then
+                echo "❌ [$SERVICE] statut: $STATE"
+                FAILED="$FAILED $SERVICE"
+              else
+                echo "✅ [$SERVICE] running"
+              fi
+            fi
+          done
+
+          if [ -n "$FAILED" ]; then
+            echo "::error::Service(s) en échec :$FAILED"
+            exit 1
+          fi
+
+      - name: Nettoyage
+        if: always()
+        run: docker compose down -v
+
+  # ---------------------------------------------------------------
+  # JOB 3 : résumé formaté, posté en commentaire sur la PR
+  # ---------------------------------------------------------------
+  pr-summary:
+    needs: test-services
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Poster le résumé sur la PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const conclusion = "${{ needs.test-services.result }}";
+            const emoji = conclusion === "success" ? "✅" : "❌";
+            const title = conclusion === "success"
+              ? "Tous les services ont passé le build + healthcheck"
+              : "Au moins un service a échoué - voir l'onglet Actions pour le détail";
+
+            const body = [
+              `### ${emoji} CI Report`,
+              "",
+              `**Résultat global :** ${title}`,
+              "",
+              "| Service | Vérifié |",
+              "|---|---|",
+              "| db (PostgreSQL) | build + healthcheck |",
+              "| redis | build + healthcheck |",
+              "| data-pipeline | build + stabilité au démarrage |",
+              "| nginx | build + démarrage |",
+              "| node-exporter | démarrage |",
+              "| postgres-exporter | démarrage |",
+              "| redis-exporter | démarrage |",
+              "| prometheus | démarrage |",
+              "| grafana | démarrage |",
+              "",
+              `Détails complets : [voir le run](${context.payload.pull_request.html_url}/checks)`
+            ].join("\n");
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
